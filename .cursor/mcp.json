@@ -1,0 +1,8 @@
+{
+	"mcpServers": {
+		"wash-ui-web": {
+			"command": "npx",
+			"args": ["-y", "@menzies-mariesta-com/wash-ui-mcp@1.3.0"]
+		}
+	}
+}

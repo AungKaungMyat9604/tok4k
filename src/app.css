@@ -1,0 +1,71 @@
+/* App-level mobile-first tweaks on top of Wash UI */
+:root {
+	--app-touch: 2.75rem;
+}
+
+html,
+body {
+	min-height: 100%;
+}
+
+body {
+	margin: 0;
+}
+
+.app-touch {
+	min-height: var(--app-touch);
+}
+
+.app-sticky-bar {
+	position: sticky;
+	bottom: 0;
+	z-index: 20;
+	padding: 0.75rem 0 calc(0.75rem + env(safe-area-inset-bottom));
+	background: color-mix(in oklab, var(--color-base-100, #fff) 92%, transparent);
+	backdrop-filter: blur(8px);
+	border-top: 1px solid color-mix(in oklab, var(--color-ink-border, #000) 15%, transparent);
+}
+
+.app-file-hit {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 0.5rem;
+	min-height: 8rem;
+	padding: 1.25rem;
+	text-align: center;
+	cursor: pointer;
+	border: 1px dashed color-mix(in oklab, var(--color-ink-border, #000) 35%, transparent);
+	border-radius: 0.75rem;
+}
+
+.app-meta-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 0.75rem;
+}
+
+@media (min-width: 640px) {
+	.app-meta-grid {
+		grid-template-columns: repeat(4, 1fr);
+	}
+}
+
+.app-meta-item {
+	display: flex;
+	flex-direction: column;
+	gap: 0.15rem;
+}
+
+.app-meta-item span:first-child {
+	font-size: 0.75rem;
+	opacity: 0.7;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+
+.app-meta-item strong {
+	font-size: 0.95rem;
+	font-weight: 600;
+}

@@ -1,0 +1,439 @@
+import {
+	detectCodecFromStbl,
+	findHandlerType,
+	getBoxHeaderSize,
+	parseBoxes,
+	updateBoxSize,
+	type Mp4Box
+} from './mp4-boxes';
+
+const DUMMY_SIZES: Record<string, number> = {
+	avc1: 8,
+	avc3: 8,
+	hvc1: 16,
+	hev1: 16,
+	vp09: 4,
+	av01: 4,
+	mp4v: 8
+};
+const DEFAULT_DUMMY_SIZE = 8;
+
+export type InflateResult = {
+	bytes: Uint8Array;
+	view: DataView;
+	originalFrames: number;
+	declaredFrames: number;
+	multiplier: number;
+	codec: string;
+};
+
+function findVideoStbl(
+	bytes: Uint8Array,
+	view: DataView,
+	moovBox: Mp4Box
+): { trak: Mp4Box; mdiaBox: Mp4Box; minfBox: Mp4Box; stblBox: Mp4Box } | null {
+	const moovChildren = parseBoxes(
+		bytes,
+		view,
+		moovBox.offset + getBoxHeaderSize(moovBox),
+		moovBox.end
+	);
+
+	for (const trak of moovChildren.filter((b) => b.type === 'trak')) {
+		const trakChildren = parseBoxes(
+			bytes,
+			view,
+			trak.offset + getBoxHeaderSize(trak),
+			trak.end
+		);
+		const mdiaBox = trakChildren.find((b) => b.type === 'mdia');
+		if (!mdiaBox) continue;
+
+		const mdiaChildren = parseBoxes(
+			bytes,
+			view,
+			mdiaBox.offset + getBoxHeaderSize(mdiaBox),
+			mdiaBox.end
+		);
+		const hdlrBox = mdiaChildren.find((b) => b.type === 'hdlr');
+		if (!hdlrBox || findHandlerType(bytes, hdlrBox) !== 'vide') continue;
+
+		const minfBox = mdiaChildren.find((b) => b.type === 'minf');
+		if (!minfBox) continue;
+
+		const minfChildren = parseBoxes(
+			bytes,
+			view,
+			minfBox.offset + getBoxHeaderSize(minfBox),
+			minfBox.end
+		);
+		const stblBox = minfChildren.find((b) => b.type === 'stbl');
+		if (!stblBox) continue;
+
+		return { trak, mdiaBox, minfBox, stblBox };
+	}
+	return null;
+}
+
+function buildSttsAtom(realCount: number, sampleDelta: number, multiplier: number): Uint8Array {
+	const fakeCount = realCount * (multiplier - 1);
+	const atomSize = 16 + 2 * 8;
+	const buffer = new ArrayBuffer(atomSize);
+	const b = new Uint8Array(buffer);
+	const v = new DataView(buffer);
+
+	v.setUint32(0, atomSize, false);
+	b.set([0x73, 0x74, 0x74, 0x73], 4); // stts
+	v.setUint32(8, 0, false);
+	v.setUint32(12, 2, false);
+	v.setUint32(16, realCount, false);
+	v.setUint32(20, sampleDelta, false);
+	v.setUint32(24, fakeCount, false);
+	v.setUint32(28, sampleDelta, false);
+	return b;
+}
+
+function buildStszAtom(
+	inputView: DataView,
+	stszBox: Mp4Box,
+	realCount: number,
+	multiplier: number,
+	dummySize: number
+): Uint8Array {
+	const fixedSize = inputView.getUint32(stszBox.offset + 12, false);
+	const totalCount = realCount * multiplier;
+	const atomSize = 20 + totalCount * 4;
+	const buffer = new ArrayBuffer(atomSize);
+	const b = new Uint8Array(buffer);
+	const v = new DataView(buffer);
+
+	v.setUint32(0, atomSize, false);
+	b.set([0x73, 0x74, 0x73, 0x7a], 4); // stsz
+	v.setUint32(8, 0, false);
+	v.setUint32(12, 0, false); // force variable sizes
+	v.setUint32(16, totalCount, false);
+
+	if (fixedSize !== 0) {
+		for (let i = 0; i < realCount; i++) {
+			v.setUint32(20 + i * 4, fixedSize, false);
+		}
+	} else {
+		const srcBase = stszBox.offset + 20;
+		for (let i = 0; i < realCount; i++) {
+			v.setUint32(20 + i * 4, inputView.getUint32(srcBase + i * 4, false), false);
+		}
+	}
+	for (let i = realCount; i < totalCount; i++) {
+		v.setUint32(20 + i * 4, dummySize, false);
+	}
+	return b;
+}
+
+function buildStcoAtom(
+	inputView: DataView,
+	stcoBox: Mp4Box,
+	origCount: number,
+	realCount: number,
+	safeOffset: number,
+	offsetDelta: number,
+	multiplier: number
+): Uint8Array {
+	const fakeCount = realCount * (multiplier - 1);
+	const newCount = origCount + fakeCount;
+	const atomSize = 16 + newCount * 4;
+	const buffer = new ArrayBuffer(atomSize);
+	const b = new Uint8Array(buffer);
+	const v = new DataView(buffer);
+
+	v.setUint32(0, atomSize, false);
+	b.set([0x73, 0x74, 0x63, 0x6f], 4); // stco
+	v.setUint32(8, 0, false);
+	v.setUint32(12, newCount, false);
+
+	const srcBase = stcoBox.offset + 16;
+	for (let i = 0; i < origCount; i++) {
+		v.setUint32(16 + i * 4, inputView.getUint32(srcBase + i * 4, false) + offsetDelta, false);
+	}
+	for (let i = 0; i < fakeCount; i++) {
+		v.setUint32(16 + (origCount + i) * 4, safeOffset, false);
+	}
+	return b;
+}
+
+function buildCo64Atom(
+	inputView: DataView,
+	co64Box: Mp4Box,
+	origCount: number,
+	realCount: number,
+	safeOffset: number,
+	offsetDelta: number,
+	multiplier: number
+): Uint8Array {
+	const fakeCount = realCount * (multiplier - 1);
+	const newCount = origCount + fakeCount;
+	const atomSize = 16 + newCount * 8;
+	const buffer = new ArrayBuffer(atomSize);
+	const b = new Uint8Array(buffer);
+	const v = new DataView(buffer);
+
+	v.setUint32(0, atomSize, false);
+	b.set([0x63, 0x6f, 0x36, 0x34], 4); // co64
+	v.setUint32(8, 0, false);
+	v.setUint32(12, newCount, false);
+
+	const srcBase = co64Box.offset + 16;
+	const safeOffsetBig = BigInt(safeOffset);
+	const offsetDeltaBig = BigInt(offsetDelta);
+	for (let i = 0; i < origCount; i++) {
+		v.setBigUint64(
+			16 + i * 8,
+			inputView.getBigUint64(srcBase + i * 8, false) + offsetDeltaBig,
+			false
+		);
+	}
+	for (let i = 0; i < fakeCount; i++) {
+		v.setBigUint64(16 + (origCount + i) * 8, safeOffsetBig, false);
+	}
+	return b;
+}
+
+function buildStscPatch(
+	inputView: DataView,
+	stscBox: Mp4Box,
+	origStcoCount: number
+): Uint8Array {
+	const origEntryCount = inputView.getUint32(stscBox.offset + 12, false);
+	const newEntryCount = origEntryCount + 1;
+	const atomSize = 16 + newEntryCount * 12;
+	const buffer = new ArrayBuffer(atomSize);
+	const b = new Uint8Array(buffer);
+	const v = new DataView(buffer);
+
+	v.setUint32(0, atomSize, false);
+	b.set([0x73, 0x74, 0x73, 0x63], 4); // stsc
+	v.setUint32(8, 0, false);
+	v.setUint32(12, newEntryCount, false);
+
+	const srcBase = stscBox.offset + 16;
+	for (let i = 0; i < origEntryCount; i++) {
+		v.setUint32(16 + i * 12, inputView.getUint32(srcBase + i * 12, false), false);
+		v.setUint32(16 + i * 12 + 4, inputView.getUint32(srcBase + i * 12 + 4, false), false);
+		v.setUint32(16 + i * 12 + 8, inputView.getUint32(srcBase + i * 12 + 8, false), false);
+	}
+
+	v.setUint32(16 + origEntryCount * 12, origStcoCount + 1, false);
+	v.setUint32(16 + origEntryCount * 12 + 4, 1, false);
+	v.setUint32(16 + origEntryCount * 12 + 8, 1, false);
+	return b;
+}
+
+function writeDummyPattern(bytes: Uint8Array, offset: number, dummySize: number) {
+	if (dummySize >= 8) {
+		// length-prefixed filler NAL (H.264-style); remaining bytes stay 0
+		bytes[offset] = 0;
+		bytes[offset + 1] = 0;
+		bytes[offset + 2] = 0;
+		bytes[offset + 3] = dummySize - 4;
+	} else if (dummySize >= 4) {
+		bytes[offset + 3] = 0;
+	}
+}
+
+/**
+ * Inflate declared video sample count (default 10x) without re-encoding pixels.
+ * Ghost samples share one trailing filler block so TikTok's ingest often keeps higher quality.
+ */
+export function inflateSampleTableVideo(
+	inputBytes: Uint8Array,
+	inputView: DataView,
+	multiplier = 10
+): InflateResult {
+	const fileSize = inputBytes.length;
+	const topBoxes = parseBoxes(inputBytes, inputView, 0, fileSize);
+	const moovBox = topBoxes.find((b) => b.type === 'moov');
+	if (!moovBox) throw new Error('MP4 moov box not found');
+	if (multiplier < 2) throw new Error('Multiplier must be at least 2');
+
+	const located = findVideoStbl(inputBytes, inputView, moovBox);
+	if (!located) throw new Error('No video track found in MP4');
+
+	const { stblBox } = located;
+	const stblChildren = parseBoxes(
+		inputBytes,
+		inputView,
+		stblBox.offset + getBoxHeaderSize(stblBox),
+		stblBox.end
+	);
+
+	const sttsBox = stblChildren.find((b) => b.type === 'stts');
+	const stszBox = stblChildren.find((b) => b.type === 'stsz');
+	const stcoBox = stblChildren.find((b) => b.type === 'stco');
+	const co64Box = stblChildren.find((b) => b.type === 'co64');
+	const stscBox = stblChildren.find((b) => b.type === 'stsc');
+	if (!sttsBox || !stszBox || !stscBox) {
+		throw new Error('MP4 sample table incomplete (need stts/stsz/stsc)');
+	}
+	if (!stcoBox && !co64Box) {
+		throw new Error('MP4 chunk offsets missing (stco/co64)');
+	}
+
+	const sttsEntryCount = inputView.getUint32(sttsBox.offset + 12, false);
+	let realCount = 0;
+	let totalDuration = 0;
+	const sttsBase = sttsBox.offset + 16;
+	for (let i = 0; i < sttsEntryCount; i++) {
+		const count = inputView.getUint32(sttsBase + i * 8, false);
+		const delta = inputView.getUint32(sttsBase + i * 8 + 4, false);
+		realCount += count;
+		totalDuration += count * delta;
+	}
+	if (realCount === 0) throw new Error('Video track has no samples');
+	const sampleDelta = Math.max(1, Math.round(totalDuration / realCount));
+
+	const codec = detectCodecFromStbl(inputBytes, stblBox);
+	const dummySize = DUMMY_SIZES[codec] ?? DEFAULT_DUMMY_SIZE;
+
+	const origChunkCount = stcoBox
+		? inputView.getUint32(stcoBox.offset + 12, false)
+		: inputView.getUint32(co64Box!.offset + 12, false);
+
+	const newStts = buildSttsAtom(realCount, sampleDelta, multiplier);
+	const newStsz = buildStszAtom(inputView, stszBox, realCount, multiplier, dummySize);
+	const newStsc = buildStscPatch(inputView, stscBox, origChunkCount);
+
+	const sttsDelta = newStts.length - sttsBox.size;
+	const stszDelta = newStsz.length - stszBox.size;
+	const stscDelta = newStsc.length - stscBox.size;
+	const fakeCount = realCount * (multiplier - 1);
+	const chunkBox = stcoBox ?? co64Box!;
+	const chunkEntrySize = stcoBox ? 4 : 8;
+	const chunkDelta = fakeCount * chunkEntrySize;
+	const moovDelta = sttsDelta + stszDelta + stscDelta + chunkDelta;
+
+	// One shared filler block at EOF (all ghost samples point here)
+	const paddingSize = dummySize;
+	const safeOffset = fileSize + moovDelta;
+	const newChunkBox = stcoBox
+		? buildStcoAtom(
+				inputView,
+				stcoBox,
+				origChunkCount,
+				realCount,
+				safeOffset,
+				moovDelta,
+				multiplier
+			)
+		: buildCo64Atom(
+				inputView,
+				co64Box!,
+				origChunkCount,
+				realCount,
+				safeOffset,
+				moovDelta,
+				multiplier
+			);
+
+	const replacements = [
+		{ box: sttsBox, bytes: newStts },
+		{ box: stszBox, bytes: newStsz },
+		{ box: stscBox, bytes: newStsc },
+		{ box: chunkBox, bytes: newChunkBox }
+	].sort((a, b) => a.box.offset - b.box.offset);
+
+	const newSize = fileSize + moovDelta + paddingSize;
+	const newBytes = new Uint8Array(newSize);
+	const newView = new DataView(newBytes.buffer);
+
+	let readPos = 0;
+	let writePos = 0;
+	for (const rep of replacements) {
+		newBytes.set(inputBytes.subarray(readPos, rep.box.offset), writePos);
+		writePos += rep.box.offset - readPos;
+		newBytes.set(rep.bytes, writePos);
+		writePos += rep.bytes.length;
+		readPos = rep.box.end;
+	}
+	newBytes.set(inputBytes.subarray(readPos, fileSize), writePos);
+	writeDummyPattern(newBytes, safeOffset, dummySize);
+
+	updateBoxSize(newView, stblBox.offset, stblBox, moovDelta);
+	updateBoxSize(newView, located.minfBox.offset, located.minfBox, moovDelta);
+	updateBoxSize(newView, located.mdiaBox.offset, located.mdiaBox, moovDelta);
+	updateBoxSize(newView, located.trak.offset, located.trak, moovDelta);
+	updateBoxSize(newView, moovBox.offset, moovBox, moovDelta);
+
+	const mdatBox = topBoxes.find((b) => b.type === 'mdat');
+	const moovBeforeMdat = Boolean(mdatBox && moovBox.offset < mdatBox.offset);
+
+	if (moovBeforeMdat) {
+		const updatedMoovSize = newView.getUint32(moovBox.offset, false);
+		const moovEnd = moovBox.offset + updatedMoovSize;
+		const moovChildren = parseBoxes(
+			newBytes,
+			newView,
+			moovBox.offset + getBoxHeaderSize(moovBox),
+			moovEnd
+		);
+		for (const trak of moovChildren.filter((b) => b.type === 'trak')) {
+			const trakChildren = parseBoxes(
+				newBytes,
+				newView,
+				trak.offset + getBoxHeaderSize(trak),
+				trak.end
+			);
+			const mdiaBox2 = trakChildren.find((b) => b.type === 'mdia');
+			if (!mdiaBox2) continue;
+			const mdiaChildren = parseBoxes(
+				newBytes,
+				newView,
+				mdiaBox2.offset + getBoxHeaderSize(mdiaBox2),
+				mdiaBox2.end
+			);
+			const minfBox2 = mdiaChildren.find((b) => b.type === 'minf');
+			if (!minfBox2) continue;
+			const minfChildren = parseBoxes(
+				newBytes,
+				newView,
+				minfBox2.offset + getBoxHeaderSize(minfBox2),
+				minfBox2.end
+			);
+			const stblBox2 = minfChildren.find((b) => b.type === 'stbl');
+			if (!stblBox2 || stblBox2.offset === stblBox.offset) continue;
+			const stblChildren2 = parseBoxes(
+				newBytes,
+				newView,
+				stblBox2.offset + getBoxHeaderSize(stblBox2),
+				stblBox2.end
+			);
+			const stcoBox2 = stblChildren2.find((b) => b.type === 'stco');
+			if (stcoBox2) {
+				const count = newView.getUint32(stcoBox2.offset + 12, false);
+				for (let i = 0; i < count; i++) {
+					const pos = stcoBox2.offset + 16 + i * 4;
+					newView.setUint32(pos, newView.getUint32(pos, false) + moovDelta, false);
+				}
+			}
+			const co64Box2 = stblChildren2.find((b) => b.type === 'co64');
+			if (co64Box2) {
+				const count = newView.getUint32(co64Box2.offset + 12, false);
+				for (let i = 0; i < count; i++) {
+					const pos = co64Box2.offset + 16 + i * 8;
+					newView.setBigUint64(
+						pos,
+						newView.getBigUint64(pos, false) + BigInt(moovDelta),
+						false
+					);
+				}
+			}
+		}
+	}
+
+	return {
+		bytes: newBytes,
+		view: newView,
+		originalFrames: realCount,
+		declaredFrames: realCount * multiplier,
+		multiplier,
+		codec
+	};
+}
